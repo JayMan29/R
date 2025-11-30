@@ -101,9 +101,23 @@ pr_data <- nis[, ..pr_cols][, lapply(.SD, as.character)]
 # 2) ICD helper (pattern = regex like "^T827" or "^A41")
 # ============================================================================
 check_icd <- function(dt, codes){
+  # Ensure the input stays a data.table for stable row-wise evaluation
+  if (!is.data.table(dt)) dt <- as.data.table(dt)
+
   pattern <- paste0("(", paste(codes, collapse="|"), ")")
   out <- dt[, lapply(.SD, function(col) grepl(pattern, col, perl=TRUE))]
-  rowSums(out, na.rm=TRUE) > 0
+
+  # Evaluate per-row hits defensively to avoid recycling/length mismatches
+  hits <- apply(out, 1L, any)
+
+  if (length(hits) != nrow(dt)) {
+    stop(sprintf(
+      "ICD check produced %s matches for %s rows; verify diagnosis/procedure inputs are aligned",
+      length(hits), nrow(dt)
+    ))
+  }
+
+  hits
 }
 
 # ============================================================================
