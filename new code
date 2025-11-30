@@ -1,0 +1,341 @@
+# ============================================================================
+# NIS 2016–2022 – ATTR BASELINE + ADVANCED CKD MODELS
+# Dummy-coding version (matches Stata-style 0/1 dummies)
+# + Yearly ATTR (hATTR / wtATTR) rates per total hospitalizations (2016–2022)
+#   with linear regression of rate ~ year for each subgroup
+# ============================================================================
+
+# ------------------------------------------------
+# Install + Load Required Packages
+# ------------------------------------------------
+packages <- c("data.table","dplyr","stringr","haven","writexl","survey")
+
+install_if_missing <- function(pkgs){
+  for (p in pkgs){
+    if (!requireNamespace(p, quietly=TRUE)){
+      install.packages(p)
+    }
+  }
+}
+install_if_missing(packages)
+lapply(packages, library, character.only=TRUE)
+
+# ------------------------------------------------
+# Clear environment
+# ------------------------------------------------
+rm(list=ls())
+
+setDTthreads(0)
+options(datatable.optimize=2, survey.lonely.psu="adjust")
+
+# ============================================================================
+# 1) Load NIS 2016–2022
+# ============================================================================
+nis_path <- "C:/Users/manad/OneDrive/NIS/NIS 2016 to 2022 CORRECT/NIS 2016to2022mega 9.20.2025 shortened columns verified.dta"
+
+if (!file.exists(nis_path)){
+  stop("ERROR: NIS file not found.")
+}
+
+vars <- names(read_dta(nis_path, n_max=1))
+
+# Year variable (handle different naming)
+year_var <- if ("YEAR" %in% vars) {
+  "YEAR"
+} else if ("NIS_YEAR" %in% vars) {
+  "NIS_YEAR"
+} else {
+  stop("No year variable (YEAR or NIS_YEAR) found in NIS file.")
+}
+
+dx_prefix <- if ("I10_DX1" %in% vars) "I10_DX" else "DX"
+dx_cols   <- paste0(dx_prefix, 1:40)
+
+pr_prefix <- if ("I10_PR1" %in% vars) "I10_PR" else "PR"
+pr_cols   <- paste0(pr_prefix, 1:15)
+
+req_cols <- intersect(c(
+  "KEY_NIS","HOSP_NIS","NIS_STRATUM","DISCWT",
+  year_var,
+  "AGE","FEMALE","RACE","RACE_NIS","ZIPINC_QRTL","PAY1",
+  "LOS","TOTCHG","DIED",
+  dx_cols, pr_cols
+), vars)
+
+nis <- read_dta(nis_path, col_select=all_of(req_cols)) |> as.data.table()
+
+dx_data <- nis[, ..dx_cols][, lapply(.SD, as.character)]
+pr_data <- nis[, ..pr_cols][, lapply(.SD, as.character)]
+
+# ============================================================================
+# 2) ICD helper
+# ============================================================================
+check_icd <- function(dx_dt, codes){
+  pattern <- paste0("(", paste(codes, collapse="|"), ")")
+  out <- dx_dt[, lapply(.SD, function(col) grepl(pattern, col, perl=TRUE))]
+  rowSums(out, na.rm=TRUE) > 0
+}
+
+# ============================================================================
+# 3) ATTR groups (FULL NIS – used for yearly rates)
+# ============================================================================
+nis[, hATTR := check_icd(dx_data, c("^E850","^E851","^E852"))]
+nis[, wtATTR := check_icd(dx_data, "^E8582")]
+
+if (nis[, all(!hATTR & !wtATTR)]) stop("No ATTR cases found in full NIS.")
+
+nis[, ATTR_group := fifelse(hATTR, "Hereditary",
+                            fifelse(wtATTR, "Wild-Type", NA_character_))]
+
+# ---- Yearly ATTR rates normalized by total hospitalizations ----
+# We keep ALL hospitalizations (not just ATTR) here.
+rates_year <- nis[, .(
+  total_hosp_wt = sum(DISCWT, na.rm = TRUE),
+  hATTR_hosp_wt = sum(DISCWT[hATTR == TRUE], na.rm = TRUE),
+  wtATTR_hosp_wt = sum(DISCWT[wtATTR == TRUE], na.rm = TRUE)
+), by = year_var]
+
+setnames(rates_year, year_var, "year")
+
+rates_year[, `:=`(
+  hATTR_rate = hATTR_hosp_wt / total_hosp_wt,
+  wtATTR_rate = wtATTR_hosp_wt / total_hosp_wt
+)]
+
+# Linear regression of rate ~ year for each ATTR subgroup
+lm_h <- lm(hATTR_rate ~ year, data = rates_year)
+lm_w <- lm(wtATTR_rate ~ year, data = rates_year)
+
+conf_h <- confint(lm_h)["year", ]
+conf_w <- confint(lm_w)["year", ]
+
+lm_results <- data.frame(
+  subgroup = c("Hereditary", "Wild-Type"),
+  intercept = c(coef(lm_h)[1], coef(lm_w)[1]),
+  slope     = c(coef(lm_h)[2], coef(lm_w)[2]),
+  slope_p   = c(
+    summary(lm_h)$coefficients["year","Pr(>|t|)"],
+    summary(lm_w)$coefficients["year","Pr(>|t|)"]
+  ),
+  CI_low    = c(conf_h[1], conf_w[1]),
+  CI_high   = c(conf_h[2], conf_w[2])
+)
+
+# ============================================================================
+# 4) Now RESTRICT to ATTR cohort for the CKD / multivariable analysis
+# ============================================================================
+nis_attr   <- nis[hATTR | wtATTR]
+dx_attr    <- dx_data[hATTR | wtATTR, ]
+pr_attr    <- pr_data[hATTR | wtATTR, ]
+
+nis        <- nis_attr
+dx_data    <- dx_attr
+pr_data    <- pr_attr
+
+nis[, ATTR_group := ifelse(hATTR == TRUE, "Hereditary", "Wild-Type")]
+nis[, ATTR_Hereditary := as.numeric(ATTR_group == "Hereditary")]   # 1 vs all other
+
+# ============================================================================
+# 5) Kidney variables (SAFE VERSION)
+# ============================================================================
+nis[, CKD1 := as.logical(check_icd(dx_data, "^N181"))]
+nis[, CKD2 := as.logical(check_icd(dx_data, "^N182"))]
+nis[, CKD3 := as.logical(check_icd(dx_data, "^N183"))]
+nis[, CKD4 := as.logical(check_icd(dx_data, "^N184"))]
+nis[, CKD5 := as.logical(check_icd(dx_data, "^N185"))]
+nis[, ESRD := as.logical(check_icd(dx_data, "^N186"))]
+nis[, AKI  := as.logical(check_icd(dx_data, "^N17"))]
+
+nis[, c("CKD1","CKD2","CKD3","CKD4","CKD5","ESRD") :=
+      lapply(.SD, function(x) ifelse(is.na(x), FALSE, x)),
+      .SDcols = c("CKD1","CKD2","CKD3","CKD4","CKD5","ESRD")]
+
+nis[, CKD_group :=
+      fifelse(CKD5 | ESRD, "CKD 5/ESRD",
+      fifelse(CKD3 | CKD4, "CKD 3-4",
+      fifelse(CKD1 | CKD2, "CKD 1-2",
+              "No CKD")))]
+
+nis[, CKD_group := factor(CKD_group,
+                          levels=c("No CKD","CKD 1-2","CKD 3-4","CKD 5/ESRD"))]
+
+nis[, adv_ckd := as.integer(CKD_group %in% c("CKD 3-4","CKD 5/ESRD"))]
+
+# ============================================================================
+# 6) Comorbidities
+# ============================================================================
+nis[, diabetes     := check_icd(dx_data, c("^E08","^E09","^E10","^E11","^E13"))]
+nis[, hypertension := check_icd(dx_data, "^I10")]
+nis[, cad          := check_icd(dx_data, c("^I20","^I21","^I22","^I23","^I24","^I25"))]
+nis[, hf           := check_icd(dx_data, "^I50")]
+nis[, obesity      := check_icd(dx_data, "^E66")]
+nis[, smoking      := check_icd(dx_data, c("^F17","^Z720"))]
+nis[, pvd          := check_icd(dx_data, "^I7[0-3]")]
+nis[, cerebro      := check_icd(dx_data, "^I6")]
+
+# ============================================================================
+# 7) Dummy Variables (Stata style)
+# ============================================================================
+
+race_var <- if ("RACE_NIS" %in% names(nis)) "RACE_NIS" else "RACE"
+
+nis[, white      := as.numeric(get(race_var) == 1)]
+nis[, black      := as.numeric(get(race_var) == 2)]
+nis[, hispanic   := as.numeric(get(race_var) == 3)]
+nis[, asian_pi   := as.numeric(get(race_var) == 4)]
+nis[, native_am  := as.numeric(get(race_var) == 5)]
+nis[, other_race := as.numeric(get(race_var) == 6)]
+
+nis[, zip_q1 := as.numeric(ZIPINC_QRTL == 1)]
+nis[, zip_q2 := as.numeric(ZIPINC_QRTL == 2)]
+nis[, zip_q3 := as.numeric(ZIPINC_QRTL == 3)]
+nis[, zip_q4 := as.numeric(ZIPINC_QRTL == 4)]
+
+nis[, pay_medcare := as.numeric(PAY1 == 1)]
+nis[, pay_medicaid:= as.numeric(PAY1 == 2)]
+nis[, pay_private := as.numeric(PAY1 == 3)]
+nis[, pay_self    := as.numeric(PAY1 == 4)]
+nis[, pay_nocharge:= as.numeric(PAY1 == 5)]
+nis[, pay_other   := as.numeric(PAY1 == 6)]
+
+nis[, female := as.numeric(FEMALE == 1)]
+
+# ============================================================================
+# 8) Subgroup counts (ATTR cohort)
+# ============================================================================
+subgroup_counts <- list(
+  total_n = nrow(nis),
+  n_hereditary = sum(nis$ATTR_Hereditary == 1),
+  n_wildtype   = sum(nis$ATTR_Hereditary == 0),
+
+  race_counts = nis[, .(
+    white = sum(white),
+    black = sum(black),
+    hispanic = sum(hispanic),
+    asian_pi = sum(asian_pi),
+    native_am = sum(native_am),
+    other_race = sum(other_race)
+  )],
+
+  payer_counts = nis[, .(
+    medicare = sum(pay_medcare),
+    medicaid = sum(pay_medicaid),
+    private = sum(pay_private),
+    selfpay = sum(pay_self),
+    nocharge = sum(pay_nocharge),
+    other = sum(pay_other)
+  )],
+
+  zip_counts = nis[, .(
+    q1 = sum(zip_q1),
+    q2 = sum(zip_q2),
+    q3 = sum(zip_q3),
+    q4 = sum(zip_q4)
+  )]
+)
+
+print(subgroup_counts)
+
+# Convert subgroup_counts into a tidy data frame for export
+subgroup_counts_df <- data.frame(
+  metric = c(
+    "total_n", "n_hereditary", "n_wildtype",
+    "white","black","hispanic","asian_pi","native_am","other_race",
+    "medicare","medicaid","private","selfpay","nocharge","other",
+    "zip_q1","zip_q2","zip_q3","zip_q4"
+  ),
+  value = c(
+    subgroup_counts$total_n,
+    subgroup_counts$n_hereditary,
+    subgroup_counts$n_wildtype,
+    subgroup_counts$race_counts$white,
+    subgroup_counts$race_counts$black,
+    subgroup_counts$race_counts$hispanic,
+    subgroup_counts$race_counts$asian_pi,
+    subgroup_counts$race_counts$native_am,
+    subgroup_counts$race_counts$other_race,
+    subgroup_counts$payer_counts$medicare,
+    subgroup_counts$payer_counts$medicaid,
+    subgroup_counts$payer_counts$private,
+    subgroup_counts$payer_counts$selfpay,
+    subgroup_counts$payer_counts$nocharge,
+    subgroup_counts$payer_counts$other,
+    subgroup_counts$zip_counts$q1,
+    subgroup_counts$zip_counts$q2,
+    subgroup_counts$zip_counts$q3,
+    subgroup_counts$zip_counts$q4
+  )
+)
+
+# ============================================================================
+# 9) Survey design (ATTR cohort)
+# ============================================================================
+design <- svydesign(
+  ids = ~HOSP_NIS,
+  strata = ~NIS_STRATUM,
+  weights = ~DISCWT,
+  data = nis,
+  nest = TRUE
+)
+
+# ============================================================================
+# 10) Univariable Models
+# ============================================================================
+predictors <- c(
+  "ATTR_Hereditary",
+  "AGE","female",
+  "white","black","hispanic","asian_pi","native_am","other_race",
+  "zip_q1","zip_q2","zip_q3","zip_q4",
+  "pay_medcare","pay_medicaid","pay_private","pay_self","pay_nocharge","pay_other",
+  "diabetes","hypertension","cad","hf",
+  "obesity","smoking","pvd","cerebro"
+)
+
+run_uni <- function(var){
+  f <- as.formula(paste("adv_ckd ~", var))
+  m <- tryCatch(svyglm(f, design=design, family=quasibinomial()), error=function(e) NULL)
+  if (is.null(m)) return(NULL)
+  s <- summary(m)$coefficients
+  OR <- exp(s[2,1])
+  CI_low <- exp(s[2,1] - 1.96*s[2,2])
+  CI_high <- exp(s[2,1] + 1.96*s[2,2])
+  p <- s[2,4]
+  data.frame(predictor=var, OR=OR, CI_low=CI_low, CI_high=CI_high, p=p)
+}
+
+uni <- bind_rows(lapply(predictors, run_uni))
+
+sig_predictors <- uni |> dplyr::filter(p <= 0.20) |> dplyr::pull(predictor)
+
+# ============================================================================
+# 11) Multivariable (only significant dummies)
+# ============================================================================
+if (length(sig_predictors) > 0){
+  f_multi <- as.formula(paste("adv_ckd ~", paste(sig_predictors, collapse=" + ")))
+  m_multi <- svyglm(f_multi, design=design, family=quasibinomial())
+  s <- summary(m_multi)$coefficients[-1,,drop=FALSE]
+  
+  multi <- data.frame(
+    predictor = rownames(s),
+    OR = exp(s[,1]),
+    CI_low = exp(s[,1] - 1.96*s[,2]),
+    CI_high = exp(s[,1] + 1.96*s[,2]),
+    p = s[,4]
+  )
+} else {
+  multi <- data.frame()
+}
+
+# ============================================================================
+# 12) Export – includes yearly ATTR rates + linear trend models
+# ============================================================================
+write_xlsx(
+  list(
+    "Subgroup_Counts_ATTR" = subgroup_counts_df,
+    "Univariable_ADVCKD"   = uni,
+    "Multivariable_ADVCKD" = multi,
+    "ATTR_Rates_by_Year"   = rates_year,
+    "ATTR_Rate_Trend_LM"   = lm_results
+  ),
+  "NIS2016_2022_dummyCoded_ADVCKD_withYearTrends.xlsx"
+)
