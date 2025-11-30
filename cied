@@ -35,7 +35,10 @@ options(datatable.optimize=2, survey.lonely.psu="adjust")
 # ============================================================================
 # 1) Load NIS 2016–2022
 # ============================================================================
-nis_path <- "C:/Users/manad/OneDrive/NIS/NIS 2016 to 2022 CORRECT/NIS 2016to2022mega 9.20.2025 shortened columns verified.dta"
+nis_path <- Sys.getenv(
+  "NIS_PATH",
+  unset = "C:/Users/manad/OneDrive/NIS/NIS 2016 to 2022 CORRECT/NIS 2016to2022mega 9.20.2025 shortened columns verified.dta"
+)
 
 if (!file.exists(nis_path)){
   stop("ERROR: NIS file not found.")
@@ -98,9 +101,27 @@ pr_data <- nis[, ..pr_cols][, lapply(.SD, as.character)]
 # 2) ICD helper (pattern = regex like "^T827" or "^A41")
 # ============================================================================
 check_icd <- function(dt, codes){
+  # Ensure the input stays a data.table for stable row-wise evaluation
+  if (!is.data.table(dt)) dt <- as.data.table(dt)
+
   pattern <- paste0("(", paste(codes, collapse="|"), ")")
   out <- dt[, lapply(.SD, function(col) grepl(pattern, col, perl=TRUE))]
-  rowSums(out, na.rm=TRUE) > 0
+
+  # Fast per-row evaluation while preserving defensive length checking
+  hits <- if (ncol(out) == 1L) {
+    out[[1L]]
+  } else {
+    rowSums(as.matrix(out)) > 0
+  }
+
+  if (length(hits) != nrow(dt)) {
+    stop(sprintf(
+      "ICD check produced %s matches for %s rows; verify diagnosis/procedure inputs are aligned",
+      length(hits), nrow(dt)
+    ))
+  }
+
+  hits
 }
 
 # ============================================================================
@@ -119,22 +140,45 @@ nis[, extraction_any := check_icd(pr_data, c("^02PA0MZ","^02PA3MZ","^0JPT0MZ","^
 # ============================================================================
 # 4) Yearly CIED incidence & mortality trends (FULL NIS)
 # ============================================================================
+all_years <- sort(unique(nis[[year_var]]))
+
 rates_year <- nis[, .(
   total_hosp_wt   = sum(DISCWT, na.rm = TRUE),
+  total_hosp_n    = .N,
   cied_hosp_wt    = sum(DISCWT[cied_inf], na.rm = TRUE),
-  cied_deaths_wt  = sum(DISCWT[cied_inf & DIED == 1], na.rm = TRUE)
+  cied_hosp_n     = sum(cied_inf, na.rm = TRUE),
+  cied_deaths_wt  = sum(DISCWT[cied_inf & DIED == 1], na.rm = TRUE),
+  cied_deaths_n   = sum(cied_inf & DIED == 1, na.rm = TRUE)
 ), by = year_var]
 
 setnames(rates_year, year_var, "year")
 
+rates_year <- data.table(year = all_years)[rates_year, on = "year"]
+
+rates_year[is.na(total_hosp_wt), `:=`(
+  total_hosp_wt = 0,
+  total_hosp_n = 0L,
+  cied_hosp_wt = 0,
+  cied_hosp_n = 0L,
+  cied_deaths_wt = 0,
+  cied_deaths_n = 0L
+)]
+
 rates_year[, `:=`(
-  cied_rate      = cied_hosp_wt / total_hosp_wt,          # proportion of all hosp
-  cied_mortality = cied_deaths_wt / cied_hosp_wt          # in-hospital mortality among CIED
+  cied_rate      = fifelse(total_hosp_wt > 0, cied_hosp_wt / total_hosp_wt, NA_real_),
+  cied_mortality = fifelse(cied_hosp_wt > 0, cied_deaths_wt / cied_hosp_wt, NA_real_)
 )]
 
 # Simple linear trend tests (incidence & mortality ~ year)
-lm_inc <- lm(cied_rate ~ year, data = rates_year)
-lm_mort <- lm(cied_mortality ~ year, data = rates_year)
+trend_data_inc <- rates_year[is.finite(cied_rate)]
+trend_data_mort <- rates_year[is.finite(cied_mortality)]
+
+if (nrow(trend_data_inc) < 2L || nrow(trend_data_mort) < 2L) {
+  stop("Insufficient non-missing yearly data to fit linear trend models for incidence and mortality.")
+}
+
+lm_inc <- lm(cied_rate ~ year, data = trend_data_inc)
+lm_mort <- lm(cied_mortality ~ year, data = trend_data_mort)
 
 conf_inc  <- confint(lm_inc)["year", ]
 conf_mort <- confint(lm_mort)["year", ]
@@ -223,7 +267,7 @@ nis[, zip_q2 := fcoalesce(as.numeric(ZIPINC_QRTL == 2), 0)]
 nis[, zip_q3 := fcoalesce(as.numeric(ZIPINC_QRTL == 3), 0)]
 nis[, zip_q4 := fcoalesce(as.numeric(ZIPINC_QRTL == 4), 0)]
 
-nis[, pay_medcare := fcoalesce(as.numeric(PAY1 == 1), 0)]
+nis[, pay_medicare := fcoalesce(as.numeric(PAY1 == 1), 0)]
 nis[, pay_medicaid:= fcoalesce(as.numeric(PAY1 == 2), 0)]
 nis[, pay_private := fcoalesce(as.numeric(PAY1 == 3), 0)]
 nis[, pay_self    := fcoalesce(as.numeric(PAY1 == 4), 0)]
@@ -245,70 +289,7 @@ if (length(eli_vars_present) > 0){
 }
 
 # ============================================================================
-# 9) Subgroup counts (CIED cohort)
-# ============================================================================
-
-subgroup_counts <- list(
-  total_n = nrow(nis),
-  
-  race_counts = nis[, .(
-    white = sum(white),
-    black = sum(black),
-    hispanic = sum(hispanic),
-    asian_pi = sum(asian_pi),
-    native_am = sum(native_am),
-    other_race = sum(other_race)
-  )],
-  
-  payer_counts = nis[, .(
-    medicare = sum(pay_medcare),
-    medicaid = sum(pay_medicaid),
-    private = sum(pay_private),
-    selfpay = sum(pay_self),
-    nocharge = sum(pay_nocharge),
-    other = sum(pay_other)
-  )],
-  
-  zip_counts = nis[, .(
-    q1 = sum(zip_q1),
-    q2 = sum(zip_q2),
-    q3 = sum(zip_q3),
-    q4 = sum(zip_q4)
-  )]
-)
-
-print(subgroup_counts)
-
-subgroup_counts_df <- data.frame(
-  metric = c(
-    "total_n",
-    "white","black","hispanic","asian_pi","native_am","other_race",
-    "medicare","medicaid","private","selfpay","nocharge","other",
-    "zip_q1","zip_q2","zip_q3","zip_q4"
-  ),
-  value = c(
-    subgroup_counts$total_n,
-    subgroup_counts$race_counts$white,
-    subgroup_counts$race_counts$black,
-    subgroup_counts$race_counts$hispanic,
-    subgroup_counts$race_counts$asian_pi,
-    subgroup_counts$race_counts$native_am,
-    subgroup_counts$race_counts$other_race,
-    subgroup_counts$payer_counts$medicare,
-    subgroup_counts$payer_counts$medicaid,
-    subgroup_counts$payer_counts$private,
-    subgroup_counts$payer_counts$selfpay,
-    subgroup_counts$payer_counts$nocharge,
-    subgroup_counts$payer_counts$other,
-    subgroup_counts$zip_counts$q1,
-    subgroup_counts$zip_counts$q2,
-    subgroup_counts$zip_counts$q3,
-    subgroup_counts$zip_counts$q4
-  )
-)
-
-# ============================================================================
-# 10) Survey design (CIED cohort)
+# 9) Survey design (CIED cohort)
 # ============================================================================
 
 design <- svydesign(
@@ -320,6 +301,99 @@ design <- svydesign(
 )
 
 # ============================================================================
+# 10) Subgroup counts (survey-weighted within CIED cohort)
+# ============================================================================
+
+weighted_total_pop <- as.numeric(svytotal(~I(1), design))
+unweighted_total_pop <- nrow(nis)
+
+weighted_totals <- function(vars, design, total_pop, data){
+  totals <- svytotal(as.formula(paste("~", paste(vars, collapse = "+"))), design)
+  data.table(
+    metric = names(totals),
+    unweighted_n = sapply(vars, function(v) sum(data[[v]] == 1, na.rm = TRUE)),
+    weighted_total = as.numeric(totals),
+    weighted_proportion = as.numeric(totals) / total_pop
+  )
+}
+
+race_vars <- c("white","black","hispanic","asian_pi","native_am","other_race")
+payer_vars <- c("pay_medicare","pay_medicaid","pay_private","pay_self","pay_nocharge","pay_other")
+zip_vars   <- c("zip_q1","zip_q2","zip_q3","zip_q4")
+
+subgroup_counts_df <- rbindlist(list(
+  data.table(
+    metric = "total_population",
+    unweighted_n = unweighted_total_pop,
+    weighted_total = weighted_total_pop,
+    weighted_proportion = 1
+  ),
+  weighted_totals(race_vars, design, weighted_total_pop, nis),
+  weighted_totals(payer_vars, design, weighted_total_pop, nis),
+  weighted_totals(zip_vars, design, weighted_total_pop, nis)
+), use.names = TRUE, fill = TRUE)
+
+print(subgroup_counts_df)
+
+# =====================================================================
+# 10A) Median, IQR, and Wilcoxon rank-sum (survey-weighted)
+# =====================================================================
+
+# Helper: get median + IQR for a continuous variable by extraction_any
+get_median_iqr <- function(var_name, design){
+  # var_name is a string, e.g., "AGE"
+
+  # Design subsets
+  d_no_ext  <- subset(design, extraction_any == 0)
+  d_ext     <- subset(design, extraction_any == 1)
+
+  # Quantiles: 25th, 50th, 75th
+  q_no_ext <- as.numeric(svyquantile(
+    as.formula(paste0("~", var_name)),
+    d_no_ext,
+    quantiles = c(0.25, 0.5, 0.75),
+    ci = FALSE,
+    na.rm = TRUE
+  ))
+
+  q_ext <- as.numeric(svyquantile(
+    as.formula(paste0("~", var_name)),
+    d_ext,
+    quantiles = c(0.25, 0.5, 0.75),
+    ci = FALSE,
+    na.rm = TRUE
+  ))
+
+  # Wilcoxon rank-sum test (survey-weighted)
+  wt <- svyranktest(
+    as.formula(paste0(var_name, " ~ factor(extraction_any)")),
+    design = design,
+    test = "wilcoxon"
+  )
+
+  p_val <- wt$p.value
+
+  data.table(
+    variable = var_name,
+    group    = c("No extraction", "Extraction"),
+    median   = c(q_no_ext[2], q_ext[2]),
+    q1       = c(q_no_ext[1], q_ext[1]),
+    q3       = c(q_no_ext[3], q_ext[3]),
+    p_value  = p_val
+  )
+}
+
+# Run for AGE, LOS, TOTCHG
+cont_vars <- c("AGE", "LOS", "TOTCHG")
+
+median_iqr_table <- rbindlist(
+  lapply(cont_vars, get_median_iqr, design = design),
+  use.names = TRUE
+)
+
+print(median_iqr_table)
+
+# ============================================================================
 # 11) Univariable logistic models for death
 # ============================================================================
 
@@ -329,7 +403,7 @@ predictors <- c(
   "AGE","female",
   "white","black","hispanic","asian_pi","native_am","other_race",
   "zip_q1","zip_q2","zip_q3","zip_q4",
-  "pay_medcare","pay_medicaid","pay_private","pay_self","pay_nocharge","pay_other",
+  "pay_medicare","pay_medicaid","pay_private","pay_self","pay_nocharge","pay_other",
   sev_vars,
   eli_vars_present
 )
@@ -379,6 +453,7 @@ if (length(sig_predictors) > 0){
 
 write_xlsx(
   list(
+    "Median_IQR_by_Extraction" = median_iqr_table,
     "Subgroup_Counts_CIED" = subgroup_counts_df,
     "Univariable_Death"    = uni,
     "Multivariable_Death"  = multi,
