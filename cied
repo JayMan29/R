@@ -175,7 +175,9 @@ rates_year[is.na(total_hosp_wt), `:=`(
 
 rates_year[, `:=`(
   cied_rate      = fifelse(total_hosp_wt > 0, cied_hosp_wt / total_hosp_wt, NA_real_),
-  cied_mortality = fifelse(cied_hosp_wt > 0, cied_deaths_wt / cied_hosp_wt, NA_real_)
+  cied_mortality = fifelse(cied_hosp_wt > 0, cied_deaths_wt / cied_hosp_wt, NA_real_),
+  cied_rate_unweighted = fifelse(total_hosp_n > 0, cied_hosp_n / total_hosp_n, NA_real_),
+  cied_mortality_unweighted = fifelse(cied_hosp_n > 0, cied_deaths_n / cied_hosp_n, NA_real_)
 )]
 
 # 95% CIs for incidence and mortality by year for plotting
