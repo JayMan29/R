@@ -356,3 +356,8 @@ write_xlsx(
   ),
   "NIS2016_2022_dummyCoded_ADVCKD_withYearTrends.xlsx"
 )
+
+message(
+  "Completed ATTR analyses. Outputs saved to NIS2016_2022_dummyCoded_ADVCKD_withYearTrends.xlsx.\n",
+  "Use less -N \"new code\" to view the full script if your editor shows a truncated preview."
+)
