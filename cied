@@ -107,6 +107,12 @@ check_icd <- function(dt, codes){
   pattern <- paste0("(", paste(codes, collapse="|"), ")")
   out <- dt[, lapply(.SD, function(col) grepl(pattern, col, perl=TRUE))]
 
+  # Fast per-row evaluation while preserving defensive length checking
+  hits <- if (ncol(out) == 1L) {
+    out[[1L]]
+  } else {
+    rowSums(as.matrix(out)) > 0
+  }
   # Evaluate per-row hits defensively to avoid recycling/length mismatches
   hits <- apply(out, 1L, any)
 
@@ -301,6 +307,64 @@ subgroup_counts_df <- rbindlist(list(
 
 print(subgroup_counts_df)
 
+# =====================================================================
+# 10A) Median, IQR, and Wilcoxon rank-sum (survey-weighted)
+# =====================================================================
+
+# Helper: get median + IQR for a continuous variable by extraction_any
+get_median_iqr <- function(var_name, design){
+  # var_name is a string, e.g., "AGE"
+
+  # Design subsets
+  d_no_ext  <- subset(design, extraction_any == 0)
+  d_ext     <- subset(design, extraction_any == 1)
+
+  # Quantiles: 25th, 50th, 75th
+  q_no_ext <- as.numeric(svyquantile(
+    as.formula(paste0("~", var_name)),
+    d_no_ext,
+    quantiles = c(0.25, 0.5, 0.75),
+    ci = FALSE,
+    na.rm = TRUE
+  ))
+
+  q_ext <- as.numeric(svyquantile(
+    as.formula(paste0("~", var_name)),
+    d_ext,
+    quantiles = c(0.25, 0.5, 0.75),
+    ci = FALSE,
+    na.rm = TRUE
+  ))
+
+  # Wilcoxon rank-sum test (survey-weighted)
+  wt <- svyranktest(
+    as.formula(paste0(var_name, " ~ factor(extraction_any)")),
+    design = design,
+    test = "wilcoxon"
+  )
+
+  p_val <- wt$p.value
+
+  data.table(
+    variable = var_name,
+    group    = c("No extraction", "Extraction"),
+    median   = c(q_no_ext[2], q_ext[2]),
+    q1       = c(q_no_ext[1], q_ext[1]),
+    q3       = c(q_no_ext[3], q_ext[3]),
+    p_value  = p_val
+  )
+}
+
+# Run for AGE, LOS, TOTCHG
+cont_vars <- c("AGE", "LOS", "TOTCHG")
+
+median_iqr_table <- rbindlist(
+  lapply(cont_vars, get_median_iqr, design = design),
+  use.names = TRUE
+)
+
+print(median_iqr_table)
+
 # ============================================================================
 # 11) Univariable logistic models for death
 # ============================================================================
@@ -361,6 +425,7 @@ if (length(sig_predictors) > 0){
 
 write_xlsx(
   list(
+    "Median_IQR_by_Extraction" = median_iqr_table,
     "Subgroup_Counts_CIED" = subgroup_counts_df,
     "Univariable_Death"    = uni,
     "Multivariable_Death"  = multi,
