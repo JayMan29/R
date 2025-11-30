@@ -113,6 +113,8 @@ check_icd <- function(dt, codes){
   } else {
     rowSums(as.matrix(out)) > 0
   }
+  # Evaluate per-row hits defensively to avoid recycling/length mismatches
+  hits <- apply(out, 1L, any)
 
   if (length(hits) != nrow(dt)) {
     stop(sprintf(
