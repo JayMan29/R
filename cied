@@ -1,0 +1,393 @@
+# ============================================================================
+# NIS 2016–2022 – CIED Infection & Extraction Analyses
+# - National CIED infection incidence (per total hospitalizations) by year
+# - CIED in-hospital mortality by year
+# - Survey-weighted univariable + multivariable logistic models for death
+#   among adult CIED infection hospitalizations
+# - Uses ICD-10-CM for CIED infection + severity; ICD-10-PCS for extraction
+# - Uses built-in NIS Elixhauser comorbidity flags (CM_* variables)
+# ============================================================================
+
+# ------------------------------------------------
+# Install + Load Required Packages
+# ------------------------------------------------
+packages <- c("data.table","dplyr","stringr","haven","writexl","survey")
+
+install_if_missing <- function(pkgs){
+  for (p in pkgs){
+    if (!requireNamespace(p, quietly=TRUE)){
+      install.packages(p)
+    }
+  }
+}
+
+invisible(install_if_missing(packages))
+invisible(lapply(packages, library, character.only=TRUE))
+
+# ------------------------------------------------
+# Clear environment
+# ------------------------------------------------
+rm(list=ls())
+
+setDTthreads(0)
+options(datatable.optimize=2, survey.lonely.psu="adjust")
+
+# ============================================================================
+# 1) Load NIS 2016–2022
+# ============================================================================
+nis_path <- "C:/Users/manad/OneDrive/NIS/NIS 2016 to 2022 CORRECT/NIS 2016to2022mega 9.20.2025 shortened columns verified.dta"
+
+if (!file.exists(nis_path)){
+  stop("ERROR: NIS file not found.")
+}
+
+vars <- names(read_dta(nis_path, n_max=1))
+
+# Year variable (handle different naming)
+year_var <- if ("YEAR" %in% vars) {
+  "YEAR"
+} else if ("NIS_YEAR" %in% vars) {
+  "NIS_YEAR"
+} else {
+  stop("No year variable (YEAR or NIS_YEAR) found in NIS file.")
+}
+
+# Diagnosis & procedure columns (ICD-10 era)
+dx_prefix <- if ("I10_DX1" %in% vars) "I10_DX" else "DX"
+raw_dx_cols   <- paste0(dx_prefix, 1:40)
+dx_cols <- intersect(raw_dx_cols, vars)
+
+if (length(dx_cols) == 0) {
+  stop("No diagnosis columns detected in NIS file.")
+}
+
+pr_prefix <- if ("I10_PR1" %in% vars) "I10_PR" else "PR"
+raw_pr_cols   <- paste0(pr_prefix, 1:15)
+pr_cols <- intersect(raw_pr_cols, vars)
+
+# Built-in Elixhauser variables (include whatever exists)
+eli_vars <- c(
+  "CM_AIDS","CM_ALCOHOL","CM_ANEMDEF","CM_ARTH","CM_BLDLOSS","CM_CHF",
+  "CM_CHRNLUNG","CM_COAG","CM_DEPRESS","CM_DM","CM_DMCX","CM_DRUG",
+  "CM_HTN_C","CM_HTN","CM_HYPOTHY","CM_LIVER","CM_LYMPH","CM_LYTES",
+  "CM_METS","CM_NEURO","CM_OBESE","CM_PARA","CM_PERIVASC","CM_PSYCH",
+  "CM_PULMCIRC","CM_RENLFAIL","CM_TUMOR","CM_ULCER","CM_VALVE","CM_WGHTLOSS"
+)
+eli_vars_present <- intersect(eli_vars, vars)
+
+# Hospital-level variables (optional; not yet used in models)
+hosp_vars <- intersect(c("HOSP_REGION","HOSP_BEDSIZE","HOSP_LOCTEACH","HOSP_UR_TEACH"), vars)
+
+req_cols <- intersect(c(
+  "KEY_NIS","HOSP_NIS","NIS_STRATUM","DISCWT",
+  year_var,
+  "AGE","FEMALE","RACE","RACE_NIS","ZIPINC_QRTL","PAY1",
+  "LOS","TOTCHG","DIED",
+  eli_vars_present,
+  hosp_vars,
+  dx_cols, pr_cols
+), vars)
+
+nis <- read_dta(nis_path, col_select = all_of(req_cols)) |> as.data.table()
+
+# Keep a clean copy of dx/pr as character
+dx_data <- nis[, ..dx_cols][, lapply(.SD, as.character)]
+pr_data <- nis[, ..pr_cols][, lapply(.SD, as.character)]
+
+# ============================================================================
+# 2) ICD helper (pattern = regex like "^T827" or "^A41")
+# ============================================================================
+check_icd <- function(dt, codes){
+  pattern <- paste0("(", paste(codes, collapse="|"), ")")
+  out <- dt[, lapply(.SD, function(col) grepl(pattern, col, perl=TRUE))]
+  rowSums(out, na.rm=TRUE) > 0
+}
+
+# ============================================================================
+# 3) Define CIED infection + extraction on FULL NIS
+# ============================================================================
+
+# CIED infection: T82.7XX* (NIS stores ICD-10 often without dot => "^T827")
+nis[, cied_inf := check_icd(dx_data, "^T827")]
+
+if (nis[, all(!cied_inf)]) stop("No CIED infection cases found in full NIS. Check code pattern.")
+
+# Extraction (any lead or generator removal)
+# 02PA0MZ, 02PA3MZ, 0JPT0MZ, 0JPT3MZ
+nis[, extraction_any := check_icd(pr_data, c("^02PA0MZ","^02PA3MZ","^0JPT0MZ","^0JPT3MZ"))]
+
+# ============================================================================
+# 4) Yearly CIED incidence & mortality trends (FULL NIS)
+# ============================================================================
+rates_year <- nis[, .(
+  total_hosp_wt   = sum(DISCWT, na.rm = TRUE),
+  cied_hosp_wt    = sum(DISCWT[cied_inf], na.rm = TRUE),
+  cied_deaths_wt  = sum(DISCWT[cied_inf & DIED == 1], na.rm = TRUE)
+), by = year_var]
+
+setnames(rates_year, year_var, "year")
+
+rates_year[, `:=`(
+  cied_rate      = cied_hosp_wt / total_hosp_wt,          # proportion of all hosp
+  cied_mortality = cied_deaths_wt / cied_hosp_wt          # in-hospital mortality among CIED
+)]
+
+# Simple linear trend tests (incidence & mortality ~ year)
+lm_inc <- lm(cied_rate ~ year, data = rates_year)
+lm_mort <- lm(cied_mortality ~ year, data = rates_year)
+
+conf_inc  <- confint(lm_inc)["year", ]
+conf_mort <- confint(lm_mort)["year", ]
+
+lm_trend_results <- data.frame(
+  outcome  = c("Incidence (cied_rate)", "Mortality (cied_mortality)"),
+  intercept = c(coef(lm_inc)[1], coef(lm_mort)[1]),
+  slope     = c(coef(lm_inc)[2], coef(lm_mort)[2]),
+  slope_p   = c(
+    summary(lm_inc)$coefficients["year","Pr(>|t|)"],
+    summary(lm_mort)$coefficients["year","Pr(>|t|)"]
+  ),
+  CI_low    = c(conf_inc[1], conf_mort[1]),
+  CI_high   = c(conf_inc[2], conf_mort[2])
+)
+
+# ============================================================================
+# 5) Restrict to adult CIED infection cohort for multivariable analysis
+# ============================================================================
+nis_cied <- nis[cied_inf == TRUE & AGE >= 18]
+dx_cied  <- dx_data[cied_inf == TRUE & AGE >= 18, ]
+pr_cied  <- pr_data[cied_inf == TRUE & AGE >= 18, ]
+
+nis     <- nis_cied
+dx_data <- dx_cied
+pr_data <- pr_cied
+
+if (nrow(nis) == 0) stop("No adult CIED infection cases after restriction.")
+
+# Define death outcome explicitly as 0/1
+nis[, death := as.numeric(DIED == 1)]
+
+# ============================================================================
+# 6) Acute severity flags (within CIED cohort)
+# ============================================================================
+
+# Sepsis & septic shock
+nis[, sepsis        := check_icd(dx_data, c("^A40", "^A41", "^R6520"))]
+nis[, septic_shock  := check_icd(dx_data, "^R6521")]
+
+# Endocarditis
+nis[, endocarditis  := check_icd(dx_data, c("^I33", "^I38", "^I39", "^T826"))]
+
+# Acute kidney injury
+nis[, AKI           := check_icd(dx_data, "^N17")]
+
+# Respiratory failure
+nis[, resp_failure  := check_icd(dx_data, "^J96")]
+
+# Mechanical ventilation
+nis[, mech_vent     := check_icd(pr_data, c("^5A1935Z","^5A1945Z","^5A1955Z"))]
+
+# Cardiogenic shock
+nis[, cardiogenic_shock := check_icd(dx_data, "^R570")]
+
+# Replace NAs with FALSE (0)
+sev_vars <- c("sepsis","septic_shock","endocarditis","AKI",
+              "resp_failure","mech_vent","cardiogenic_shock")
+nis[, (sev_vars) := lapply(.SD, function(x) ifelse(is.na(x), FALSE, x)), .SDcols = sev_vars]
+
+# ============================================================================
+# 7) Demographic dummy variables (Stata style)
+# ============================================================================
+
+race_var <- fifelse("RACE_NIS" %in% names(nis), "RACE_NIS",
+                    fifelse("RACE" %in% names(nis), "RACE", NA_character_))
+
+if (is.na(race_var)) {
+  nis[, c("RACE_NIS","RACE") := .(NA_real_, NA_real_)]
+  race_var <- "RACE"
+}
+
+if (!"ZIPINC_QRTL" %in% names(nis)) nis[, ZIPINC_QRTL := NA_real_]
+if (!"PAY1" %in% names(nis)) nis[, PAY1 := NA_real_]
+if (!"FEMALE" %in% names(nis)) nis[, FEMALE := NA_real_]
+
+nis[, white      := fcoalesce(as.numeric(get(race_var) == 1), 0)]
+nis[, black      := fcoalesce(as.numeric(get(race_var) == 2), 0)]
+nis[, hispanic   := fcoalesce(as.numeric(get(race_var) == 3), 0)]
+nis[, asian_pi   := fcoalesce(as.numeric(get(race_var) == 4), 0)]
+nis[, native_am  := fcoalesce(as.numeric(get(race_var) == 5), 0)]
+nis[, other_race := fcoalesce(as.numeric(get(race_var) == 6), 0)]
+
+nis[, zip_q1 := fcoalesce(as.numeric(ZIPINC_QRTL == 1), 0)]
+nis[, zip_q2 := fcoalesce(as.numeric(ZIPINC_QRTL == 2), 0)]
+nis[, zip_q3 := fcoalesce(as.numeric(ZIPINC_QRTL == 3), 0)]
+nis[, zip_q4 := fcoalesce(as.numeric(ZIPINC_QRTL == 4), 0)]
+
+nis[, pay_medcare := fcoalesce(as.numeric(PAY1 == 1), 0)]
+nis[, pay_medicaid:= fcoalesce(as.numeric(PAY1 == 2), 0)]
+nis[, pay_private := fcoalesce(as.numeric(PAY1 == 3), 0)]
+nis[, pay_self    := fcoalesce(as.numeric(PAY1 == 4), 0)]
+nis[, pay_nocharge:= fcoalesce(as.numeric(PAY1 == 5), 0)]
+nis[, pay_other   := fcoalesce(as.numeric(PAY1 == 6), 0)]
+
+nis[, female := fcoalesce(as.numeric(FEMALE == 1), 0)]
+
+# ============================================================================
+# 8) Elixhauser comorbidities (built-in CM_* variables)
+# ============================================================================
+
+# Convert existing CM_* vars to 0/1 numerics if present
+eli_vars_present <- intersect(eli_vars, names(nis))
+if (length(eli_vars_present) > 0){
+  for (v in eli_vars_present){
+    nis[, (v) := fcoalesce(as.numeric(get(v) == 1), 0)]
+  }
+}
+
+# ============================================================================
+# 9) Subgroup counts (CIED cohort)
+# ============================================================================
+
+subgroup_counts <- list(
+  total_n = nrow(nis),
+  
+  race_counts = nis[, .(
+    white = sum(white),
+    black = sum(black),
+    hispanic = sum(hispanic),
+    asian_pi = sum(asian_pi),
+    native_am = sum(native_am),
+    other_race = sum(other_race)
+  )],
+  
+  payer_counts = nis[, .(
+    medicare = sum(pay_medcare),
+    medicaid = sum(pay_medicaid),
+    private = sum(pay_private),
+    selfpay = sum(pay_self),
+    nocharge = sum(pay_nocharge),
+    other = sum(pay_other)
+  )],
+  
+  zip_counts = nis[, .(
+    q1 = sum(zip_q1),
+    q2 = sum(zip_q2),
+    q3 = sum(zip_q3),
+    q4 = sum(zip_q4)
+  )]
+)
+
+print(subgroup_counts)
+
+subgroup_counts_df <- data.frame(
+  metric = c(
+    "total_n",
+    "white","black","hispanic","asian_pi","native_am","other_race",
+    "medicare","medicaid","private","selfpay","nocharge","other",
+    "zip_q1","zip_q2","zip_q3","zip_q4"
+  ),
+  value = c(
+    subgroup_counts$total_n,
+    subgroup_counts$race_counts$white,
+    subgroup_counts$race_counts$black,
+    subgroup_counts$race_counts$hispanic,
+    subgroup_counts$race_counts$asian_pi,
+    subgroup_counts$race_counts$native_am,
+    subgroup_counts$race_counts$other_race,
+    subgroup_counts$payer_counts$medicare,
+    subgroup_counts$payer_counts$medicaid,
+    subgroup_counts$payer_counts$private,
+    subgroup_counts$payer_counts$selfpay,
+    subgroup_counts$payer_counts$nocharge,
+    subgroup_counts$payer_counts$other,
+    subgroup_counts$zip_counts$q1,
+    subgroup_counts$zip_counts$q2,
+    subgroup_counts$zip_counts$q3,
+    subgroup_counts$zip_counts$q4
+  )
+)
+
+# ============================================================================
+# 10) Survey design (CIED cohort)
+# ============================================================================
+
+design <- svydesign(
+  ids = ~HOSP_NIS,
+  strata = ~NIS_STRATUM,
+  weights = ~DISCWT,
+  data = nis,
+  nest = TRUE
+)
+
+# ============================================================================
+# 11) Univariable logistic models for death
+# ============================================================================
+
+# Candidate predictors (filter to those actually present)
+predictors <- c(
+  "extraction_any",
+  "AGE","female",
+  "white","black","hispanic","asian_pi","native_am","other_race",
+  "zip_q1","zip_q2","zip_q3","zip_q4",
+  "pay_medcare","pay_medicaid","pay_private","pay_self","pay_nocharge","pay_other",
+  sev_vars,
+  eli_vars_present
+)
+
+predictors <- predictors[predictors %in% names(nis)]
+
+run_uni <- function(var){
+  f <- as.formula(paste("death ~", var))
+  m <- tryCatch(svyglm(f, design = design, family = quasibinomial()), error = function(e) NULL)
+  if (is.null(m)) return(NULL)
+  s <- summary(m)$coefficients
+  # For numeric/binary predictor, the 2nd row is the variable of interest
+  OR <- exp(s[2,1])
+  CI_low <- exp(s[2,1] - 1.96*s[2,2])
+  CI_high <- exp(s[2,1] + 1.96*s[2,2])
+  p <- s[2,4]
+  data.frame(predictor = var, OR = OR, CI_low = CI_low, CI_high = CI_high, p = p)
+}
+
+uni <- bind_rows(lapply(predictors, run_uni))
+
+sig_predictors <- uni |> dplyr::filter(p <= 0.20) |> dplyr::pull(predictor)
+
+# ============================================================================
+# 12) Multivariable logistic model for death (p <= 0.20 predictors)
+# ============================================================================
+
+if (length(sig_predictors) > 0){
+  f_multi <- as.formula(paste("death ~", paste(sig_predictors, collapse = " + ")))
+  m_multi <- svyglm(f_multi, design = design, family = quasibinomial())
+  s <- summary(m_multi)$coefficients[-1,,drop=FALSE]
+  
+  multi <- data.frame(
+    predictor = rownames(s),
+    OR        = exp(s[,1]),
+    CI_low    = exp(s[,1] - 1.96*s[,2]),
+    CI_high   = exp(s[,1] + 1.96*s[,2]),
+    p         = s[,4]
+  )
+} else {
+  multi <- data.frame()
+}
+
+# ============================================================================
+# 13) Export – CIED incidence/mortality + models
+# ============================================================================
+
+write_xlsx(
+  list(
+    "Subgroup_Counts_CIED" = subgroup_counts_df,
+    "Univariable_Death"    = uni,
+    "Multivariable_Death"  = multi,
+    "CIED_Rates_by_Year"   = rates_year,
+    "CIED_Rate_Trend_LM"   = lm_trend_results
+  ),
+  "NIS2016_2022_CIED_Extraction_Death_Analysis.xlsx"
+)
+
+message(
+  "Completed CIED infection analyses. Outputs saved to NIS2016_2022_CIED_Extraction_Death_Analysis.xlsx.\n"
+)
