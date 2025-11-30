@@ -35,7 +35,10 @@ options(datatable.optimize=2, survey.lonely.psu="adjust")
 # ============================================================================
 # 1) Load NIS 2016–2022
 # ============================================================================
-nis_path <- "C:/Users/manad/OneDrive/NIS/NIS 2016 to 2022 CORRECT/NIS 2016to2022mega 9.20.2025 shortened columns verified.dta"
+nis_path <- Sys.getenv(
+  "NIS_PATH",
+  unset = "C:/Users/manad/OneDrive/NIS/NIS 2016 to 2022 CORRECT/NIS 2016to2022mega 9.20.2025 shortened columns verified.dta"
+)
 
 if (!file.exists(nis_path)){
   stop("ERROR: NIS file not found.")
@@ -223,7 +226,7 @@ nis[, zip_q2 := fcoalesce(as.numeric(ZIPINC_QRTL == 2), 0)]
 nis[, zip_q3 := fcoalesce(as.numeric(ZIPINC_QRTL == 3), 0)]
 nis[, zip_q4 := fcoalesce(as.numeric(ZIPINC_QRTL == 4), 0)]
 
-nis[, pay_medcare := fcoalesce(as.numeric(PAY1 == 1), 0)]
+nis[, pay_medicare := fcoalesce(as.numeric(PAY1 == 1), 0)]
 nis[, pay_medicaid:= fcoalesce(as.numeric(PAY1 == 2), 0)]
 nis[, pay_private := fcoalesce(as.numeric(PAY1 == 3), 0)]
 nis[, pay_self    := fcoalesce(as.numeric(PAY1 == 4), 0)]
@@ -245,70 +248,7 @@ if (length(eli_vars_present) > 0){
 }
 
 # ============================================================================
-# 9) Subgroup counts (CIED cohort)
-# ============================================================================
-
-subgroup_counts <- list(
-  total_n = nrow(nis),
-  
-  race_counts = nis[, .(
-    white = sum(white),
-    black = sum(black),
-    hispanic = sum(hispanic),
-    asian_pi = sum(asian_pi),
-    native_am = sum(native_am),
-    other_race = sum(other_race)
-  )],
-  
-  payer_counts = nis[, .(
-    medicare = sum(pay_medcare),
-    medicaid = sum(pay_medicaid),
-    private = sum(pay_private),
-    selfpay = sum(pay_self),
-    nocharge = sum(pay_nocharge),
-    other = sum(pay_other)
-  )],
-  
-  zip_counts = nis[, .(
-    q1 = sum(zip_q1),
-    q2 = sum(zip_q2),
-    q3 = sum(zip_q3),
-    q4 = sum(zip_q4)
-  )]
-)
-
-print(subgroup_counts)
-
-subgroup_counts_df <- data.frame(
-  metric = c(
-    "total_n",
-    "white","black","hispanic","asian_pi","native_am","other_race",
-    "medicare","medicaid","private","selfpay","nocharge","other",
-    "zip_q1","zip_q2","zip_q3","zip_q4"
-  ),
-  value = c(
-    subgroup_counts$total_n,
-    subgroup_counts$race_counts$white,
-    subgroup_counts$race_counts$black,
-    subgroup_counts$race_counts$hispanic,
-    subgroup_counts$race_counts$asian_pi,
-    subgroup_counts$race_counts$native_am,
-    subgroup_counts$race_counts$other_race,
-    subgroup_counts$payer_counts$medicare,
-    subgroup_counts$payer_counts$medicaid,
-    subgroup_counts$payer_counts$private,
-    subgroup_counts$payer_counts$selfpay,
-    subgroup_counts$payer_counts$nocharge,
-    subgroup_counts$payer_counts$other,
-    subgroup_counts$zip_counts$q1,
-    subgroup_counts$zip_counts$q2,
-    subgroup_counts$zip_counts$q3,
-    subgroup_counts$zip_counts$q4
-  )
-)
-
-# ============================================================================
-# 10) Survey design (CIED cohort)
+# 9) Survey design (CIED cohort)
 # ============================================================================
 
 design <- svydesign(
@@ -320,6 +260,34 @@ design <- svydesign(
 )
 
 # ============================================================================
+# 10) Subgroup counts (survey-weighted within CIED cohort)
+# ============================================================================
+
+weighted_total_pop <- as.numeric(svytotal(~I(1), design))
+
+weighted_totals <- function(vars, design, total_pop){
+  totals <- svytotal(as.formula(paste("~", paste(vars, collapse = "+"))), design)
+  data.table(
+    metric = names(totals),
+    weighted_total = as.numeric(totals),
+    weighted_proportion = as.numeric(totals) / total_pop
+  )
+}
+
+race_vars <- c("white","black","hispanic","asian_pi","native_am","other_race")
+payer_vars <- c("pay_medicare","pay_medicaid","pay_private","pay_self","pay_nocharge","pay_other")
+zip_vars   <- c("zip_q1","zip_q2","zip_q3","zip_q4")
+
+subgroup_counts_df <- rbindlist(list(
+  data.table(metric = "total_weighted_population", weighted_total = weighted_total_pop, weighted_proportion = 1),
+  weighted_totals(race_vars, design, weighted_total_pop),
+  weighted_totals(payer_vars, design, weighted_total_pop),
+  weighted_totals(zip_vars, design, weighted_total_pop)
+), use.names = TRUE, fill = TRUE)
+
+print(subgroup_counts_df)
+
+# ============================================================================
 # 11) Univariable logistic models for death
 # ============================================================================
 
@@ -329,7 +297,7 @@ predictors <- c(
   "AGE","female",
   "white","black","hispanic","asian_pi","native_am","other_race",
   "zip_q1","zip_q2","zip_q3","zip_q4",
-  "pay_medcare","pay_medicaid","pay_private","pay_self","pay_nocharge","pay_other",
+  "pay_medicare","pay_medicaid","pay_private","pay_self","pay_nocharge","pay_other",
   sev_vars,
   eli_vars_present
 )
