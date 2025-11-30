@@ -113,6 +113,8 @@ check_icd <- function(dt, codes){
   } else {
     rowSums(as.matrix(out)) > 0
   }
+  # Evaluate per-row hits defensively to avoid recycling/length mismatches
+  hits <- apply(out, 1L, any)
 
   if (length(hits) != nrow(dt)) {
     stop(sprintf(
@@ -360,6 +362,92 @@ subgroup_counts_df <- rbindlist(list(
     weighted_total = weighted_total_pop,
     weighted_proportion = 1
   ),
+  weighted_totals(race_vars, design, weighted_total_pop),
+  weighted_totals(payer_vars, design, weighted_total_pop),
+  weighted_totals(zip_vars, design, weighted_total_pop)
+), use.names = TRUE, fill = TRUE)
+
+print(subgroup_counts_df)
+
+# =====================================================================
+# 10A) Median, IQR, and Wilcoxon rank-sum (survey-weighted)
+# =====================================================================
+
+# Helper: get median + IQR for a continuous variable by extraction_any
+get_median_iqr <- function(var_name, design){
+  # var_name is a string, e.g., "AGE"
+
+  # Design subsets
+  d_no_ext  <- subset(design, extraction_any == 0)
+  d_ext     <- subset(design, extraction_any == 1)
+
+  # Quantiles: 25th, 50th, 75th
+  q_no_ext <- as.numeric(svyquantile(
+    as.formula(paste0("~", var_name)),
+    d_no_ext,
+    quantiles = c(0.25, 0.5, 0.75),
+    ci = FALSE,
+    na.rm = TRUE
+  ))
+
+  q_ext <- as.numeric(svyquantile(
+    as.formula(paste0("~", var_name)),
+    d_ext,
+    quantiles = c(0.25, 0.5, 0.75),
+    ci = FALSE,
+    na.rm = TRUE
+  ))
+
+  # Wilcoxon rank-sum test (survey-weighted)
+  wt <- svyranktest(
+    as.formula(paste0(var_name, " ~ factor(extraction_any)")),
+    design = design,
+    test = "wilcoxon"
+  )
+
+  p_val <- wt$p.value
+
+  data.table(
+    variable = var_name,
+    group    = c("No extraction", "Extraction"),
+    median   = c(q_no_ext[2], q_ext[2]),
+    q1       = c(q_no_ext[1], q_ext[1]),
+    q3       = c(q_no_ext[3], q_ext[3]),
+    p_value  = p_val
+  )
+}
+
+# Run for AGE, LOS, TOTCHG
+cont_vars <- c("AGE", "LOS", "TOTCHG")
+
+median_iqr_table <- rbindlist(
+  lapply(cont_vars, get_median_iqr, design = design),
+  use.names = TRUE
+)
+
+print(median_iqr_table)
+
+# ============================================================================
+# 10) Subgroup counts (survey-weighted within CIED cohort)
+# ============================================================================
+
+weighted_total_pop <- as.numeric(svytotal(~I(1), design))
+
+weighted_totals <- function(vars, design, total_pop){
+  totals <- svytotal(as.formula(paste("~", paste(vars, collapse = "+"))), design)
+  data.table(
+    metric = names(totals),
+    weighted_total = as.numeric(totals),
+    weighted_proportion = as.numeric(totals) / total_pop
+  )
+}
+
+race_vars <- c("white","black","hispanic","asian_pi","native_am","other_race")
+payer_vars <- c("pay_medicare","pay_medicaid","pay_private","pay_self","pay_nocharge","pay_other")
+zip_vars   <- c("zip_q1","zip_q2","zip_q3","zip_q4")
+
+subgroup_counts_df <- rbindlist(list(
+  data.table(metric = "total_weighted_population", weighted_total = weighted_total_pop, weighted_proportion = 1),
   weighted_totals(race_vars, design, weighted_total_pop),
   weighted_totals(payer_vars, design, weighted_total_pop),
   weighted_totals(zip_vars, design, weighted_total_pop)
