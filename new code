@@ -17,8 +17,9 @@ install_if_missing <- function(pkgs){
     }
   }
 }
-install_if_missing(packages)
-lapply(packages, library, character.only=TRUE)
+
+invisible(install_if_missing(packages))
+invisible(lapply(packages, library, character.only=TRUE))
 
 # ------------------------------------------------
 # Clear environment
@@ -49,10 +50,16 @@ year_var <- if ("YEAR" %in% vars) {
 }
 
 dx_prefix <- if ("I10_DX1" %in% vars) "I10_DX" else "DX"
-dx_cols   <- paste0(dx_prefix, 1:40)
+raw_dx_cols   <- paste0(dx_prefix, 1:40)
+dx_cols <- intersect(raw_dx_cols, vars)
+
+if (length(dx_cols) == 0) {
+  stop("No diagnosis columns detected in NIS file.")
+}
 
 pr_prefix <- if ("I10_PR1" %in% vars) "I10_PR" else "PR"
-pr_cols   <- paste0(pr_prefix, 1:15)
+raw_pr_cols   <- paste0(pr_prefix, 1:15)
+pr_cols <- intersect(raw_pr_cols, vars)
 
 req_cols <- intersect(c(
   "KEY_NIS","HOSP_NIS","NIS_STRATUM","DISCWT",
@@ -177,28 +184,38 @@ nis[, cerebro      := check_icd(dx_data, "^I6")]
 # 7) Dummy Variables (Stata style)
 # ============================================================================
 
-race_var <- if ("RACE_NIS" %in% names(nis)) "RACE_NIS" else "RACE"
+race_var <- fifelse("RACE_NIS" %in% names(nis), "RACE_NIS",
+             fifelse("RACE" %in% names(nis), "RACE", NA_character_))
 
-nis[, white      := as.numeric(get(race_var) == 1)]
-nis[, black      := as.numeric(get(race_var) == 2)]
-nis[, hispanic   := as.numeric(get(race_var) == 3)]
-nis[, asian_pi   := as.numeric(get(race_var) == 4)]
-nis[, native_am  := as.numeric(get(race_var) == 5)]
-nis[, other_race := as.numeric(get(race_var) == 6)]
+if (is.na(race_var)) {
+  nis[, c("RACE_NIS","RACE") := .(NA_real_, NA_real_)]
+  race_var <- "RACE"
+}
 
-nis[, zip_q1 := as.numeric(ZIPINC_QRTL == 1)]
-nis[, zip_q2 := as.numeric(ZIPINC_QRTL == 2)]
-nis[, zip_q3 := as.numeric(ZIPINC_QRTL == 3)]
-nis[, zip_q4 := as.numeric(ZIPINC_QRTL == 4)]
+if (!"ZIPINC_QRTL" %in% names(nis)) nis[, ZIPINC_QRTL := NA_real_]
+if (!"PAY1" %in% names(nis)) nis[, PAY1 := NA_real_]
+if (!"FEMALE" %in% names(nis)) nis[, FEMALE := NA_real_]
 
-nis[, pay_medcare := as.numeric(PAY1 == 1)]
-nis[, pay_medicaid:= as.numeric(PAY1 == 2)]
-nis[, pay_private := as.numeric(PAY1 == 3)]
-nis[, pay_self    := as.numeric(PAY1 == 4)]
-nis[, pay_nocharge:= as.numeric(PAY1 == 5)]
-nis[, pay_other   := as.numeric(PAY1 == 6)]
+nis[, white      := fcoalesce(as.numeric(get(race_var) == 1), 0)]
+nis[, black      := fcoalesce(as.numeric(get(race_var) == 2), 0)]
+nis[, hispanic   := fcoalesce(as.numeric(get(race_var) == 3), 0)]
+nis[, asian_pi   := fcoalesce(as.numeric(get(race_var) == 4), 0)]
+nis[, native_am  := fcoalesce(as.numeric(get(race_var) == 5), 0)]
+nis[, other_race := fcoalesce(as.numeric(get(race_var) == 6), 0)]
 
-nis[, female := as.numeric(FEMALE == 1)]
+nis[, zip_q1 := fcoalesce(as.numeric(ZIPINC_QRTL == 1), 0)]
+nis[, zip_q2 := fcoalesce(as.numeric(ZIPINC_QRTL == 2), 0)]
+nis[, zip_q3 := fcoalesce(as.numeric(ZIPINC_QRTL == 3), 0)]
+nis[, zip_q4 := fcoalesce(as.numeric(ZIPINC_QRTL == 4), 0)]
+
+nis[, pay_medcare := fcoalesce(as.numeric(PAY1 == 1), 0)]
+nis[, pay_medicaid:= fcoalesce(as.numeric(PAY1 == 2), 0)]
+nis[, pay_private := fcoalesce(as.numeric(PAY1 == 3), 0)]
+nis[, pay_self    := fcoalesce(as.numeric(PAY1 == 4), 0)]
+nis[, pay_nocharge:= fcoalesce(as.numeric(PAY1 == 5), 0)]
+nis[, pay_other   := fcoalesce(as.numeric(PAY1 == 6), 0)]
+
+nis[, female := fcoalesce(as.numeric(FEMALE == 1), 0)]
 
 # ============================================================================
 # 8) Subgroup counts (ATTR cohort)
@@ -338,4 +355,9 @@ write_xlsx(
     "ATTR_Rate_Trend_LM"   = lm_results
   ),
   "NIS2016_2022_dummyCoded_ADVCKD_withYearTrends.xlsx"
+)
+
+message(
+  "Completed ATTR analyses. Outputs saved to NIS2016_2022_dummyCoded_ADVCKD_withYearTrends.xlsx.\n",
+  "Use less -N \"new code\" to view the full script if your editor shows a truncated preview."
 )
